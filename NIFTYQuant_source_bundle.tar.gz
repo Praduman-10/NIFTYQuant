@@ -1,0 +1,1 @@
+Source bundle is stored separately because the GitHub contents API wrapper only accepts UTF-8 text for create_file. Use the repository README for the consolidated source layout.
