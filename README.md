@@ -1,5 +1,5 @@
 # NIFTYQuant Dashboard
-
+https://niftyquant-eyq8nth9hjbjwpcajbqqjw.streamlit.app/
 ### NIFTY 50 Options Intelligence & Quantitative Decision-Support Terminal
 
 NIFTYQuant is a quantitative options-analysis dashboard built for the NIFTY 50 derivatives market. It brings market data, volatility, option positioning, liquidity, Greeks, contract scoring, and multi-expiry analysis into a single decision-support environment.
