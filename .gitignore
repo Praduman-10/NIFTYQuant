@@ -1,0 +1,12 @@
+.env
+.env.*
+*.db
+*.sqlite
+*.sqlite3
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+*.bak
+*_BACKUP.py
+snapshots/
+.DS_Store
