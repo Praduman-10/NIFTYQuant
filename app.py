@@ -1,11 +1,29 @@
 from pathlib import Path
 import html
+import os
 import sqlite3
+from datetime import date, timedelta
+
 import pandas as pd
+import requests
 import streamlit as st
+from streamlit_autorefresh import st_autorefresh
+
+# Streamlit Cloud secrets are exposed through st.secrets; keep the token out of GitHub.
+try:
+    UPSTOX_ACCESS_TOKEN = st.secrets.get("UPSTOX_ACCESS_TOKEN", "")
+except Exception:
+    UPSTOX_ACCESS_TOKEN = os.getenv("UPSTOX_ACCESS_TOKEN", "")
+
+from config import UNDERLYING
+from upstox.parser import option_chain_to_dataframe
+from upstox.historical import get_daily_closes
+from engine.scoring_engine import OptionsScoringEngine
+from engine.quality_score import calculate_tqs
 
 DB_PATH = Path("database/niftyquant.db")
 TABLE = "option_snapshots"
+LIVE_INTERVAL_MS = 60_000
 
 st.set_page_config(page_title="NIFTYQuant Pro", page_icon="📊", layout="wide", initial_sidebar_state="expanded")
 
@@ -41,8 +59,10 @@ st.markdown("""
 .stat-l { color:#5f5f5f; font-size:.58rem; text-transform:uppercase; }
 .stat-v { color:#d7d7d7; font-size:.69rem; font-weight:800; margin-top:2px; }
 .read { color:#8a8a8a; font-size:.64rem; margin-top:9px; }
+.live-note { color:#555; font-size:.64rem; margin-top:7px; }
 </style>
 """, unsafe_allow_html=True)
+
 
 def fmt_compact(x):
     x = float(x or 0)
@@ -50,41 +70,140 @@ def fmt_compact(x):
     if abs(x) >= 1_000: return f"{x/1_000:.1f}K"
     return f"{x:,.0f}"
 
+
 def card(label, value, sub=""):
     return f'<div class="card"><div class="label">{html.escape(label)}</div><div class="value">{html.escape(value)}</div><div class="sub">{html.escape(sub)}</div></div>'
 
-if not DB_PATH.exists():
-    st.error(f"Database file not found: {DB_PATH}")
-    st.stop()
 
-with sqlite3.connect(DB_PATH) as conn:
-    df = pd.read_sql(f"SELECT * FROM {TABLE}", conn)
+def live_headers(token):
+    return {"Accept": "application/json", "Authorization": f"Bearer {token}"}
 
-if df.empty:
-    st.warning("No option-chain data is currently stored in SQLite.")
-    st.stop()
 
-for col in ["expiry", "as_of"]:
-    df[col] = pd.to_datetime(df[col], errors="coerce")
-for col in ["strike","ltp","iv","hv","vrp","delta","oi","volume","bid_ask_spread_pct","spot","buy_edge_score","sell_edge_score","trade_quality"]:
-    if col in df.columns: df[col] = pd.to_numeric(df[col], errors="coerce")
+@st.cache_data(ttl=600, show_spinner=False)
+def fetch_live_expiries(token):
+    r = requests.get(
+        "https://api.upstox.com/v2/option/contract",
+        headers=live_headers(token),
+        params={"instrument_key": UNDERLYING},
+        timeout=20,
+    )
+    r.raise_for_status()
+    values = sorted({x.get("expiry") for x in r.json().get("data", []) if x.get("expiry")})
+    today = date.today().isoformat()
+    return [x for x in values if x >= today][:20]
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def fetch_live_chain(expiry, token):
+    r = requests.get(
+        "https://api.upstox.com/v2/option/chain",
+        headers=live_headers(token),
+        params={"instrument_key": UNDERLYING, "expiry_date": expiry},
+        timeout=20,
+    )
+    r.raise_for_status()
+    chain = r.json().get("data", [])
+    if not chain:
+        raise RuntimeError("Upstox returned an empty option chain.")
+    return option_chain_to_dataframe(chain)
+
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def fetch_history(token):
+    to_date = date.today().strftime("%Y-%m-%d")
+    from_date = (date.today() - timedelta(days=90)).strftime("%Y-%m-%d")
+    return get_daily_closes(from_date=from_date, to_date=to_date)
+
+
+def build_live_snapshot(expiry):
+    chain = fetch_live_chain(expiry, UPSTOX_ACCESS_TOKEN)
+    if chain.empty:
+        raise RuntimeError("No live contracts were returned.")
+    spot = float(chain["spot"].iloc[0])
+    engine = OptionsScoringEngine()
+    try:
+        engine.seed_daily_history(fetch_history(UPSTOX_ACCESS_TOKEN))
+    except Exception:
+        # Keep the live chain usable even if the historical endpoint is temporarily unavailable.
+        pass
+    scored = engine.update(chain, spot=spot, as_of=pd.Timestamp.now())
+    if scored.empty:
+        raise RuntimeError("The scoring engine could not produce live option scores.")
+    scored = calculate_tqs(scored, spot)
+    scored["expiry"] = pd.to_datetime(scored["expiry"])
+    return scored, spot, pd.Timestamp.now()
+
+
+def load_database():
+    if not DB_PATH.exists():
+        return pd.DataFrame()
+    with sqlite3.connect(DB_PATH) as conn:
+        d = pd.read_sql(f"SELECT * FROM {TABLE}", conn)
+    for col in ["expiry", "as_of"]:
+        if col in d.columns: d[col] = pd.to_datetime(d[col], errors="coerce")
+    for col in ["strike","ltp","iv","hv","vrp","delta","oi","volume","bid_ask_spread_pct","spot","buy_edge_score","sell_edge_score","trade_quality"]:
+        if col in d.columns: d[col] = pd.to_numeric(d[col], errors="coerce")
+    return d
+
+
+# Automatic one-minute rerun. Live mode is enabled by default when the Upstox secret exists.
+st_autorefresh(interval=LIVE_INTERVAL_MS, key="niftyquant_live_refresh")
 
 st.sidebar.markdown('<div style="font-size:1.25rem;font-weight:900;color:#fff;">NIFTYQuant</div><div style="color:#666;font-size:.68rem;margin-bottom:22px;">OPTIONS INTELLIGENCE TERMINAL</div>', unsafe_allow_html=True)
-expiries = sorted(df["expiry"].dropna().dt.strftime("%Y-%m-%d").unique())
-selected = st.sidebar.selectbox("EXPIRY", expiries, index=0)
+
+live_available = bool(UPSTOX_ACCESS_TOKEN)
+if live_available:
+    live_mode = st.sidebar.toggle("LIVE ANALYTICS", value=True)
+else:
+    live_mode = False
+    st.sidebar.caption("Add UPSTOX_ACCESS_TOKEN in Streamlit Secrets to enable live analytics.")
+
+try:
+    if live_mode:
+        live_expiries = fetch_live_expiries(UPSTOX_ACCESS_TOKEN)
+        if not live_expiries:
+            raise RuntimeError("No future expiries were returned by Upstox.")
+        selected = st.sidebar.selectbox("EXPIRY", live_expiries, index=0)
+        latest_all, spot, latest = build_live_snapshot(selected)
+        data_mode = "LIVE API"
+    else:
+        db = load_database()
+        if db.empty:
+            st.error("Database file not found or empty. Add an Upstox secret to enable live analytics.")
+            st.stop()
+        expiries = sorted(db["expiry"].dropna().dt.strftime("%Y-%m-%d").unique())
+        selected = st.sidebar.selectbox("EXPIRY", expiries, index=0)
+        snapshot = db[db["expiry"] == pd.Timestamp(selected)].copy()
+        latest = snapshot["as_of"].max()
+        latest_all = snapshot[snapshot["as_of"] == latest].copy()
+        spot = float(latest_all["spot"].iloc[0])
+        data_mode = "SNAPSHOT"
+except Exception as exc:
+    if live_mode:
+        st.sidebar.error("Live feed unavailable")
+        st.error(f"Live analytics could not refresh: {type(exc).__name__}: {exc}")
+        db = load_database()
+        if db.empty: st.stop()
+        expiries = sorted(db["expiry"].dropna().dt.strftime("%Y-%m-%d").unique())
+        selected = st.sidebar.selectbox("EXPIRY", expiries, index=0)
+        snapshot = db[db["expiry"] == pd.Timestamp(selected)].copy()
+        latest = snapshot["as_of"].max()
+        latest_all = snapshot[snapshot["as_of"] == latest].copy()
+        spot = float(latest_all["spot"].iloc[0])
+        data_mode = "SNAPSHOT FALLBACK"
+    else:
+        raise
+
 limit = st.sidebar.slider("CONTRACTS", 5, 20, 10, 5)
 min_tqs = st.sidebar.slider("MIN TRADE QUALITY", 0, 100, 90, 5)
 
-snapshot = df[df["expiry"] == pd.Timestamp(selected)].copy()
-latest = snapshot["as_of"].max()
-latest_all = snapshot[snapshot["as_of"] == latest].copy()
 if latest_all.empty:
     st.warning("No current snapshot is available for the selected expiry.")
     st.stop()
 
-spot = float(latest_all["spot"].iloc[0])
 atm = float(latest_all.loc[(latest_all["strike"] - spot).abs().idxmin(), "strike"])
-atm_iv = float(latest_all[latest_all["strike"] == atm]["iv"].median())
+atm_rows = latest_all[latest_all["strike"] == atm]
+atm_iv = float(atm_rows["iv"].median())
 hv = float(latest_all["hv"].median())
 vrp = atm_iv - hv
 ce_oi = float(latest_all.loc[latest_all["option_type"] == "CE", "oi"].sum())
@@ -105,9 +224,11 @@ position_state = "PUT HEAVY" if pcr >= 1.2 else ("CALL HEAVY" if pcr <= .8 else 
 c1, c2 = st.columns([5,1])
 with c1:
     st.markdown('<div class="nq-kicker">NIFTY 50 - OPTIONS INTELLIGENCE</div><div class="nq-brand">NIFTYQuant Pro</div>', unsafe_allow_html=True)
-    st.markdown(f'<div class="nq-sub">Quantitative options decision-support terminal - Latest snapshot {latest.strftime("%d %b %Y %H:%M:%S")}</div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="nq-sub">Quantitative options decision-support terminal - {data_mode} - Latest snapshot {latest.strftime("%d %b %Y %H:%M:%S")}</div>', unsafe_allow_html=True)
 with c2:
-    st.markdown('<div style="text-align:right;margin-top:15px"><span class="live"><span class="dot">●</span> LIVE ANALYTICS</span></div>', unsafe_allow_html=True)
+    pill = "LIVE ANALYTICS" if data_mode == "LIVE API" else data_mode
+    dot = "●" if data_mode == "LIVE API" else "○"
+    st.markdown(f'<div style="text-align:right;margin-top:15px"><span class="live"><span class="dot">{dot}</span> {pill}</span></div>', unsafe_allow_html=True)
 st.divider()
 
 kpis=[("NIFTY SPOT",f"{spot:,.2f}",f"ATM {atm:,.0f}"),("ATM IV",f"{atm_iv:.2f}%","Implied volatility"),("REALIZED HV",f"{hv:.2f}%","20D historical volatility"),("PCR",f"{pcr:.2f}",f"PE OI {fmt_compact(pe_oi)}"),("VRP",f"{vrp:+.2f}%","IV minus HV")]
@@ -171,4 +292,5 @@ mc1,mc2=st.columns([2,1])
 with mc1: st.markdown(f'<div style="font-size:1.15rem;font-weight:900;color:#fff;">{regime}</div><div style="color:#888;font-size:.75rem;line-height:1.6;margin-top:7px;">{read_text}</div>',unsafe_allow_html=True)
 with mc2: st.markdown(f'<div style="color:#777;font-size:.7rem;">SPOT / ATM</div><div style="color:#fff;font-weight:900;margin-top:3px;">{spot:,.2f} / {atm:,.0f}</div><div style="color:#777;font-size:.7rem;margin-top:8px;">PCR / VRP</div><div style="color:#fff;font-weight:900;margin-top:3px;">{pcr:.2f} / {vrp:+.2f}%</div>',unsafe_allow_html=True)
 st.markdown('</div>',unsafe_allow_html=True)
-st.markdown(f'<div style="text-align:center;color:#444;font-size:.64rem;padding:16px 0;">NIFTYQuant Pro | Snapshot {latest.strftime("%Y-%m-%d %H:%M:%S")} | Quantitative decision-support only</div>',unsafe_allow_html=True)
+st.markdown(f'<div class="live-note" style="text-align:center;">{data_mode} | Automatic refresh every 60 seconds | Quantitative decision-support only</div>',unsafe_allow_html=True)
+st.markdown(f'<div style="text-align:center;color:#444;font-size:.64rem;padding:8px 0 16px;">NIFTYQuant Pro | Snapshot {latest.strftime("%Y-%m-%d %H:%M:%S")}</div>',unsafe_allow_html=True)
