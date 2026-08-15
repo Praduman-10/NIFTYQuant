@@ -16,7 +16,8 @@ It displays NIFTY spot, the ATM strike, implied volatility, realized historical 
 
 This allows the user to understand the broader volatility and positioning environment before looking at individual option contracts.
 
-![NIFTYQuant Dashboard Overview](screenshots/dashboard-overview.png)
+<img width="1882" height="930" alt="image" src="https://github.com/user-attachments/assets/5c623184-7b71-4b93-a1f4-fbdf8496af2c" />
+
 
 ---
 
@@ -55,7 +56,8 @@ This makes it possible to compare contracts using multiple quantitative characte
 
 For example, two contracts may have similar Buy Edge scores while having different TQS values because of differences in liquidity, spread, delta, open interest, volatility characteristics, or other scoring factors.
 
-![NIFTYQuant Trade Quality Matrix](screenshots/trade-quality-matrix.png)
+<img width="1857" height="815" alt="image" src="https://github.com/user-attachments/assets/5f6234b3-7dc6-4c26-bc7f-3ce84fb20281" />
+
 
 ---
 
@@ -69,7 +71,8 @@ The **Open Interest Structure** shows call and put open interest across strikes.
 
 These charts are designed to provide additional market context and should be interpreted together with spot price, volatility, liquidity, and contract-level metrics rather than used as standalone prediction tools.
 
-![NIFTYQuant Volatility and Open Interest Analysis](screenshots/volatility-open-interest.png)
+<img width="1865" height="607" alt="image" src="https://github.com/user-attachments/assets/1fb85290-8f18-4750-8e12-fa9b0f8633de" />
+
 
 ---
 
